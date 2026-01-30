@@ -1,6 +1,38 @@
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
+
+-- Enable RLS extension
+CREATE EXTENSION IF NOT EXISTS "pg_stat_statements";
+
+-- 1. Create a helper function to extract tenant_id from the JWT
+CREATE OR REPLACE FUNCTION auth.tenant_id() 
+RETURNS TEXT AS $$
+  SELECT NULLIF(current_setting('request.jwt.claims', true)::json->>'tenant_id', '')::TEXT;
+$$ LANGUAGE sql STABLE;
+
+-- 2. Apply Policy to Properties
+-- This policy ensures users can only access properties that belong to their own tenant.
+CREATE POLICY tenant_property_isolation ON properties
+    FOR ALL
+    TO authenticated
+    USING (tenant_id = auth.tenant_id())
+    WITH CHECK (tenant_id = auth.tenant_id());
+
+-- 3. Apply Policy to Reservations
+CREATE POLICY tenant_reservation_isolation ON reservations
+    FOR ALL
+    TO authenticated
+    USING (tenant_id = auth.tenant_id())
+    WITH CHECK (tenant_id = auth.tenant_id());
+
+-- 4. Apply Policy to Tenants
+-- Users should only be able to see their own tenant record
+CREATE POLICY tenant_self_isolation ON tenants
+    FOR SELECT
+    TO authenticated
+    USING (id = auth.tenant_id());
+
 -- Tenants Table
 CREATE TABLE tenants (
     id TEXT PRIMARY KEY,
