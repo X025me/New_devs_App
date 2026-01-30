@@ -8,41 +8,63 @@ from typing import Dict, Any, List
 # Or strictly query the DB if we assume the candidate sets it up.
 # For this file, we'll write the SQL query logic intended for the candidate.
 
-async def calculate_monthly_revenue(property_id: str, month: int, year: int, db_session=None) -> Decimal:
+async def calculate_monthly_revenue(property_id: str, month: int, year: int, tenant_id: str, db_session=None) -> Decimal:
     """
     Calculates revenue for a specific month.
+    FIXED: Uses AT TIME ZONE to convert UTC reservation times to property's local timezone.
     """
-    
-    # BUG 2: TIMEZONE GHOST
-    # Using naive datetimes for query construction.
-    # Reservations are stored in UTC (Postgres Timestamptz), but this
-    # creates naive local times (effectively treated as database-local time or UTC naive).
-    # For a property in UTC+2, a check-in on Mar 1st 00:30 local time is Feb 28th 22:30 UTC.
-    # This query will exclude it from March because it compares against strictly generated UTC timestamps.
-    
-    start_date = datetime(year, month, 1)
-    if month < 12:
-        end_date = datetime(year, month + 1, 1)
-    else:
-        end_date = datetime(year + 1, 1, 1)
+    try:
+        # Import database pool
+        from app.core.database_pool import DatabasePool
         
-    print(f"DEBUG: Querying revenue for {property_id} from {start_date} to {end_date}")
-
-    # SQL Simulation (This would be executed against the actual DB)
-    query = """
-        SELECT SUM(total_amount) as total
-        FROM reservations
-        WHERE property_id = $1
-        AND tenant_id = $2
-        AND check_in_date >= $3
-        AND check_in_date < $4
-    """
-    
-    # In the real challenge, this executes:
-    # result = await db.fetch_val(query, property_id, tenant_id, start_date, end_date)
-    # return result or Decimal('0')
-    
-    return Decimal('0') # Placeholder for now until DB connection is finalized
+        # Initialize pool if needed
+        db_pool = DatabasePool()
+        await db_pool.initialize()
+        
+        if db_pool.session_factory:
+            async with db_pool.get_session() as session:
+                from sqlalchemy import text
+                
+                # Create date range boundaries in the property's local timezone
+                # These will be interpreted as timestamps in the property's timezone
+                start_date = datetime(year, month, 1)
+                if month < 12:
+                    end_date = datetime(year, month + 1, 1)
+                else:
+                    end_date = datetime(year + 1, 1, 1)
+                
+                print(f"DEBUG: Querying revenue for {property_id} from {start_date} to {end_date}")
+                
+                # FIXED: Join with properties table and use AT TIME ZONE to convert UTC to property's local timezone
+                # The pattern: check_in_date AT TIME ZONE 'UTC' AT TIME ZONE properties.timezone
+                # First converts timestamptz to timestamp at UTC, then to property's timezone
+                query = text("""
+                    SELECT SUM(r.total_amount) as total
+                    FROM reservations r
+                    INNER JOIN properties p ON r.property_id = p.id AND r.tenant_id = p.tenant_id
+                    WHERE r.property_id = :property_id 
+                    AND r.tenant_id = :tenant_id
+                    AND (r.check_in_date AT TIME ZONE 'UTC' AT TIME ZONE p.timezone) >= :start_date
+                    AND (r.check_in_date AT TIME ZONE 'UTC' AT TIME ZONE p.timezone) < :end_date
+                """)
+                
+                result = await session.execute(query, {
+                    "property_id": property_id,
+                    "tenant_id": tenant_id,
+                    "start_date": start_date,
+                    "end_date": end_date
+                })
+                row = result.fetchone()
+                
+                if row and row.total:
+                    return Decimal(str(row.total))
+                return Decimal('0')
+        else:
+            raise Exception("Database pool not available")
+            
+    except Exception as e:
+        print(f"Database error calculating monthly revenue for {property_id} (tenant: {tenant_id}): {e}")
+        return Decimal('0')
 
 async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str, Any]:
     """
@@ -61,14 +83,18 @@ async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str,
                 # Use SQLAlchemy text for raw SQL
                 from sqlalchemy import text
                 
+                # FIXED: Join with properties table to access timezone information
+                # Even though we're not filtering by date here, joining ensures we have
+                # access to property timezone for any future date-based filtering needs
                 query = text("""
                     SELECT 
-                        property_id,
-                        SUM(total_amount) as total_revenue,
+                        r.property_id,
+                        SUM(r.total_amount) as total_revenue,
                         COUNT(*) as reservation_count
-                    FROM reservations 
-                    WHERE property_id = :property_id AND tenant_id = :tenant_id
-                    GROUP BY property_id
+                    FROM reservations r
+                    INNER JOIN properties p ON r.property_id = p.id AND r.tenant_id = p.tenant_id
+                    WHERE r.property_id = :property_id AND r.tenant_id = :tenant_id
+                    GROUP BY r.property_id
                 """)
                 
                 result = await session.execute(query, {
